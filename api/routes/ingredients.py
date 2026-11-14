@@ -282,6 +282,14 @@ async def bulk_upload_ingredients(
     valid_parents = (
         db.search_ingredients_batch(all_parent_names) if all_parent_names else {}
     )
+    db_parents_by_name = {
+        name.casefold(): parent for name, parent in valid_parents.items()
+    }
+    # A parent may be defined by this same upload, so index every batch name
+    # instead of requiring the parent to already exist in the database.
+    batch_indices_by_name: dict[str, int] = {}
+    for idx, ingredient in enumerate(bulk_data.ingredients):
+        batch_indices_by_name.setdefault(ingredient.name.casefold(), idx)
     batch_validation_duration = time.time() - validation_start
     logger.info(f"Batch validation completed in {batch_validation_duration:.3f}s")
 
@@ -306,19 +314,33 @@ async def bulk_upload_ingredients(
                 failed_ingredient_indices.add(idx)
                 continue
 
-            # Check if parent exists (using batch results)
+            # Check if parent exists (using batch results or this upload)
             if ingredient_data.parent_name is not None:
-                if ingredient_data.parent_name not in valid_parents:
-                    validation_errors.append(
-                        BulkIngredientUploadValidationError(
-                            ingredient_index=idx,
-                            ingredient_name=ingredient_data.name,
-                            error_type="parent_not_found",
-                            error_message=f"No exact match found for parent ingredient '{ingredient_data.parent_name}'",
+                parent_key = ingredient_data.parent_name.casefold()
+                if parent_key not in db_parents_by_name:
+                    parent_idx = batch_indices_by_name.get(parent_key)
+                    if parent_idx is None:
+                        validation_errors.append(
+                            BulkIngredientUploadValidationError(
+                                ingredient_index=idx,
+                                ingredient_name=ingredient_data.name,
+                                error_type="parent_not_found",
+                                error_message=f"No exact match found for parent ingredient '{ingredient_data.parent_name}'",
+                            )
                         )
-                    )
-                    failed_ingredient_indices.add(idx)
-                    continue
+                        failed_ingredient_indices.add(idx)
+                        continue
+                    if parent_idx == idx:
+                        validation_errors.append(
+                            BulkIngredientUploadValidationError(
+                                ingredient_index=idx,
+                                ingredient_name=ingredient_data.name,
+                                error_type="invalid_parent",
+                                error_message=f"Ingredient '{ingredient_data.name}' cannot be its own parent",
+                            )
+                        )
+                        failed_ingredient_indices.add(idx)
+                        continue
             elif ingredient_data.parent_id is not None:
                 # Legacy parent ID validation (still needs individual query)
                 parent_exists = db.execute_query(
@@ -360,6 +382,48 @@ async def bulk_upload_ingredients(
     validation_duration = time.time() - validation_start
     logger.info(f"Validation phase completed in {validation_duration:.3f}s")
 
+    # Order creation so a parent in this batch is created before its children,
+    # and report circular parent references instead of creating a partial tree.
+    creation_order: list[int] = []
+    visited_indices: set[int] = set()
+    visiting_indices: set[int] = set()
+    cyclic_indices: set[int] = set()
+
+    def visit(index: int) -> bool:
+        if index in visited_indices:
+            return index not in cyclic_indices
+        if index in visiting_indices:
+            cyclic_indices.add(index)
+            return False
+        visiting_indices.add(index)
+        parent_idx = None
+        parent_name = bulk_data.ingredients[index].parent_name
+        if parent_name is not None:
+            parent_key = parent_name.casefold()
+            if parent_key not in db_parents_by_name:
+                parent_idx = batch_indices_by_name.get(parent_key)
+        if parent_idx is not None and not visit(parent_idx):
+            cyclic_indices.add(index)
+        visiting_indices.discard(index)
+        visited_indices.add(index)
+        creation_order.append(index)
+        return index not in cyclic_indices
+
+    for idx in range(len(bulk_data.ingredients)):
+        if idx not in failed_ingredient_indices:
+            visit(idx)
+
+    for idx in sorted(cyclic_indices):
+        validation_errors.append(
+            BulkIngredientUploadValidationError(
+                ingredient_index=idx,
+                ingredient_name=bulk_data.ingredients[idx].name,
+                error_type="invalid_parent",
+                error_message="Circular parent reference in bulk upload",
+            )
+        )
+        failed_ingredient_indices.add(idx)
+
     # Step 2: If there are validation errors, return them without creating any ingredients
     if validation_errors:
         total_duration = time.time() - start_time
@@ -377,7 +441,9 @@ async def bulk_upload_ingredients(
     creation_start = time.time()
     logger.info("Starting ingredient creation phase")
 
-    for idx, ingredient_data in enumerate(bulk_data.ingredients):
+    created_ids_by_name: dict[str, int] = {}
+    for idx in creation_order:
+        ingredient_data = bulk_data.ingredients[idx]
         try:
             ingredient_creation_start = time.time()
             logger.debug(f"Creating ingredient {idx}: {ingredient_data.name}")
@@ -385,14 +451,17 @@ async def bulk_upload_ingredients(
             # Convert parent name to ID if needed
             parent_id = None
             if ingredient_data.parent_name is not None:
-                parent_data = valid_parents.get(ingredient_data.parent_name)
+                parent_key = ingredient_data.parent_name.casefold()
+                parent_data = db_parents_by_name.get(parent_key)
                 if parent_data:
                     parent_id = parent_data["id"]
                 else:
-                    # This shouldn't happen since we validated above, but just in case
-                    raise ValueError(
-                        f"Parent ingredient '{ingredient_data.parent_name}' not found during conversion"
-                    )
+                    parent_id = created_ids_by_name.get(parent_key)
+                    if parent_id is None:
+                        # This shouldn't happen since we validated above
+                        raise ValueError(
+                            f"Parent ingredient '{ingredient_data.parent_name}' not found during conversion"
+                        )
             elif ingredient_data.parent_id is not None:
                 # Use parent ID directly (backward compatibility)
                 parent_id = ingredient_data.parent_id
@@ -409,6 +478,9 @@ async def bulk_upload_ingredients(
             # Create the ingredient
             created_ingredient = db.create_ingredient(ingredient_dict)
             uploaded_ingredients.append(IngredientResponse(**created_ingredient))
+            created_ids_by_name[ingredient_data.name.casefold()] = created_ingredient[
+                "id"
+            ]
 
             ingredient_creation_duration = time.time() - ingredient_creation_start
             logger.debug(
