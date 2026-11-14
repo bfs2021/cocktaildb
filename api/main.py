@@ -27,6 +27,7 @@ from core.exception_handlers import (
     validation_exception_handler,
 )
 from core.exceptions import CocktailDBException
+from core.release_info import read_release_info
 from middleware.rate_limit import RateLimitMiddleware
 from routes import (
     analytics,
@@ -150,11 +151,19 @@ async def root():
     }
 
 
+# Read once at startup: the identity is fixed for the life of the image.
+RELEASE_INFO = read_release_info()
+
+
 # Health check endpoint
 @app.get("/health", tags=["health"])
 async def health_check():
     """Health check endpoint for container orchestration."""
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "release": RELEASE_INFO,
+    }
 
 
 # For local development
