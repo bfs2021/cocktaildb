@@ -9,45 +9,66 @@ from typing import Any
 
 import pytest
 from models.requests import BulkIngredientUpload
-from routes.ingredients import bulk_upload_ingredients
+from routes.ingredients import MAX_INGREDIENT_DEPTH, bulk_upload_ingredients
 
 EDITOR = SimpleNamespace(user_id="editor-1")
 
 
 class FakeBulkIngredientDB:
-    """Minimal stand-in for Database covering the bulk upload code path."""
+    """Minimal stand-in for Database covering the bulk upload code path.
 
-    def __init__(self, existing: dict[str, int] | None = None):
-        self.existing = {
-            name.casefold(): ingredient_id
-            for name, ingredient_id in (existing or {}).items()
-        }
+    ``existing`` maps ingredient names to materialized paths such as
+    ``"/1/7/"``; the last path segment is the ingredient's id.
+    """
+
+    def __init__(
+        self,
+        existing: dict[str, str] | None = None,
+        fail_on: set[str] | None = None,
+    ):
+        self.rows: dict[int, dict[str, Any]] = {}
+        for name, path in (existing or {}).items():
+            ingredient_id = int(path.strip("/").split("/")[-1])
+            self.rows[ingredient_id] = {"id": ingredient_id, "name": name, "path": path}
+        self.fail_on = fail_on or set()
         self.created: list[dict[str, Any]] = []
         self._next_id = 100
 
+    def _find(self, name: str) -> dict[str, Any] | None:
+        return next(
+            (row for row in self.rows.values() if row["name"].lower() == name.lower()),
+            None,
+        )
+
     def check_ingredient_names_batch(self, names: list[str]) -> dict[str, bool]:
-        return {name: name.casefold() in self.existing for name in names}
+        return {name: self._find(name) is not None for name in names}
 
     def search_ingredients_batch(self, names: list[str]) -> dict[str, dict[str, Any]]:
         results: dict[str, dict[str, Any]] = {}
         for name in names:
-            ingredient_id = self.existing.get(name.casefold())
-            if ingredient_id is not None:
-                results[name] = {"id": ingredient_id, "name": name}
+            row = self._find(name)
+            if row is not None:
+                results[name] = dict(row)
         return results
 
     def execute_query(self, *_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
         raise AssertionError("bulk upload should not issue per-row queries")
 
     def create_ingredient(self, data: dict[str, Any]) -> dict[str, Any]:
+        if data["name"] in self.fail_on:
+            raise RuntimeError(f"insert failed for {data['name']}")
+        if self._find(data["name"]) is not None:
+            raise RuntimeError(f"duplicate key value: {data['name']}")
         ingredient_id = self._next_id
         self._next_id += 1
+        parent_id = data.get("parent_id")
+        parent_path = self.rows[parent_id]["path"] if parent_id else "/"
         row = {
             "id": ingredient_id,
             "name": data["name"],
             "description": data.get("description"),
-            "parent_id": data.get("parent_id"),
-            "path": f"/{data['name']}/",
+            "parent_id": parent_id,
+            "path": f"{parent_path}{ingredient_id}/",
             "allow_substitution": bool(data.get("allow_substitution")),
             "percent_abv": None,
             "sugar_g_per_l": None,
@@ -55,6 +76,7 @@ class FakeBulkIngredientDB:
             "url": None,
             "created_by": data.get("created_by"),
         }
+        self.rows[ingredient_id] = row
         self.created.append(row)
         return row
 
@@ -99,11 +121,13 @@ async def test_parent_defined_later_in_batch_is_created_first():
     assert response.validation_errors == []
     assert [row["name"] for row in db.created] == ["Cat", "Brand"]
     assert db.created[1]["parent_id"] == db.created[0]["id"]
+    # The response follows request order, not creation order.
+    assert [i.name for i in response.uploaded_ingredients] == ["Brand", "Cat"]
 
 
 @pytest.mark.asyncio
 async def test_parent_from_database_still_resolves():
-    db = FakeBulkIngredientDB({"Vodka": 7})
+    db = FakeBulkIngredientDB({"Vodka": "/7/"})
 
     response = await _upload(db, [{"name": "Premium Vodka", "parent_name": "Vodka"}])
 
@@ -138,3 +162,159 @@ async def test_circular_parent_reference_is_rejected():
     assert response.uploaded_count == 0
     assert {e.error_type for e in response.validation_errors} == {"invalid_parent"}
     assert db.created == []
+
+
+def _errors_by_index(response: Any) -> dict[int, tuple[str, str]]:
+    return {
+        e.ingredient_index: (e.error_type, e.error_message)
+        for e in response.validation_errors
+    }
+
+
+@pytest.mark.asyncio
+async def test_same_batch_parent_matches_case_insensitively():
+    db = FakeBulkIngredientDB()
+
+    response = await _upload(
+        db,
+        [
+            {"name": "Cat"},
+            {"name": "Brand", "parent_name": "cAT"},
+        ],
+    )
+
+    assert response.validation_errors == []
+    assert db.created[1]["parent_id"] == db.created[0]["id"]
+
+
+@pytest.mark.asyncio
+async def test_name_repeated_in_batch_is_rejected_before_creating_anything():
+    db = FakeBulkIngredientDB()
+
+    response = await _upload(
+        db,
+        [
+            {"name": "Cat"},
+            {"name": "cat", "parent_name": "Cat"},
+        ],
+    )
+
+    errors = _errors_by_index(response)
+    assert list(errors) == [1]
+    assert errors[1][0] == "duplicate_name"
+    assert "more than once" in errors[1][1]
+    assert response.failed_count == 1
+    assert db.created == []
+
+
+@pytest.mark.asyncio
+async def test_self_parent_is_rejected():
+    db = FakeBulkIngredientDB()
+
+    response = await _upload(db, [{"name": "A", "parent_name": "a"}])
+
+    assert [e.error_type for e in response.validation_errors] == ["invalid_parent"]
+    assert db.created == []
+
+
+@pytest.mark.asyncio
+async def test_row_below_a_cycle_is_not_reported_as_part_of_it():
+    db = FakeBulkIngredientDB()
+
+    response = await _upload(
+        db,
+        [
+            {"name": "A", "parent_name": "B"},
+            {"name": "B", "parent_name": "A"},
+            {"name": "C", "parent_name": "A"},
+        ],
+    )
+
+    errors = _errors_by_index(response)
+    assert "Circular" in errors[0][1]
+    assert "Circular" in errors[1][1]
+    assert errors[2][0] == "invalid_parent"
+    assert "Circular" not in errors[2][1]
+    assert "'A'" in errors[2][1]
+    assert db.created == []
+
+
+@pytest.mark.asyncio
+async def test_child_of_invalid_batch_parent_is_also_reported():
+    db = FakeBulkIngredientDB()
+
+    response = await _upload(
+        db,
+        [
+            {"name": "Brand", "parent_name": "Cat"},
+            {"name": "Cat", "parent_name": "Missing"},
+        ],
+    )
+
+    errors = _errors_by_index(response)
+    assert errors[1][0] == "parent_not_found"
+    assert errors[0][0] == "invalid_parent"
+    assert "'Cat'" in errors[0][1]
+    assert response.failed_count == 2
+    assert db.created == []
+
+
+@pytest.mark.asyncio
+async def test_long_same_batch_chain_is_rejected_without_recursion_error():
+    db = FakeBulkIngredientDB()
+    count = 1000
+    # Row i is the child of row i + 1; the last row is top level.
+    rows = [
+        {"name": f"Level {i}", "parent_name": f"Level {i + 1}"}
+        for i in range(count - 1)
+    ] + [{"name": f"Level {count - 1}"}]
+
+    response = await _upload(db, rows)
+
+    errors = _errors_by_index(response)
+    # The ten rows nearest the top fit within the depth limit.
+    assert set(errors) == set(range(count - MAX_INGREDIENT_DEPTH))
+    assert errors[count - MAX_INGREDIENT_DEPTH - 1][0] == "depth_exceeded"
+    assert db.created == []
+
+
+@pytest.mark.asyncio
+async def test_depth_limit_counts_existing_ancestors():
+    # "Deep" is already at the maximum depth minus one.
+    deep_path = "/" + "/".join(str(i) for i in range(1, MAX_INGREDIENT_DEPTH)) + "/"
+    db = FakeBulkIngredientDB({"Deep": deep_path})
+
+    response = await _upload(
+        db,
+        [
+            {"name": "At Limit", "parent_name": "Deep"},
+            {"name": "Too Deep", "parent_name": "At Limit"},
+        ],
+    )
+
+    errors = _errors_by_index(response)
+    assert list(errors) == [1]
+    assert errors[1][0] == "depth_exceeded"
+    assert db.created == []
+
+
+@pytest.mark.asyncio
+async def test_children_of_a_parent_that_fails_to_create_are_skipped():
+    db = FakeBulkIngredientDB(fail_on={"Cat"})
+
+    response = await _upload(
+        db,
+        [
+            {"name": "Brand", "parent_name": "Cat"},
+            {"name": "Cat"},
+            {"name": "Other"},
+        ],
+    )
+
+    errors = _errors_by_index(response)
+    assert errors[1][0] == "creation_error"
+    assert errors[0][0] == "creation_error"
+    assert "parent ingredient 'Cat' failed to create" in errors[0][1]
+    assert [row["name"] for row in db.created] == ["Other"]
+    assert response.uploaded_count == 1
+    assert response.failed_count == 2
